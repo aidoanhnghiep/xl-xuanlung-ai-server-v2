@@ -1,0 +1,9 @@
+{
+  "name": "xl-xuanlung-ai-server-v2",
+  "version": "1.0.0",
+  "type": "module",
+  "dependencies": {
+    "openai": "^4.77.0",
+    "node-fetch": "^3.3.2"
+  }
+}
