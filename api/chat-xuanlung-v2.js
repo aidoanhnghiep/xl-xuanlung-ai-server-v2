@@ -1,373 +1,120 @@
-// ================== API CHAT – XUÂN LŨNG V2 (TTHC + TÀI LIỆU) ==================
-import OpenAI from "openai";
 import fetch from "node-fetch";
+import { GoogleSpreadsheet } from "google-spreadsheet";
+import { JWT } from "google-auth-library";
+import OpenAI from "openai";
 
-// ====== KẾT NỐI OPENAI ======
-const client = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
+// ====== CONFIG ======
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
+const KB_SHEET_URL = process.env.KB_SHEET_URL;      // Sheet giới thiệu: XL_XuanLung_AI_Master
+const TTHC_SHEET_URL = process.env.TTHC_SHEET_URL;  // Sheet thủ tục hành chính
+
+// GOOGLE AUTH
+const jwt = new JWT({
+  email: process.env.GOOGLE_SERVICE_EMAIL,
+  key: process.env.GOOGLE_PRIVATE_KEY.replace(/\\n/g, "\n"),
+  scopes: ["https://www.googleapis.com/auth/spreadsheets.readonly"],
 });
 
-// ====== ENV ======
-// CSV Google Sheet TTHC (bản hộ kinh doanh + các thủ tục khác)
-const TTHC_SHEET_URL = process.env.TTHC_SHEET_URL || "";
+// ====== HÀM ĐỌC GOOGLE SHEET ======
+async function loadGoogleSheet(sheetUrl) {
+  const sheetId = sheetUrl.match(/spreadsheets\/d\/(.+?)\//)[1];
+  const doc = new GoogleSpreadsheet(sheetId, jwt);
 
-// CSV Google Sheet kho tài liệu AI (XL_XuanLung_AI_Master)
-const KB_SHEET_URL = process.env.KB_SHEET_URL || "";
+  await doc.loadInfo();
+  const sheet = doc.sheetsByIndex[0];
+  const rows = await sheet.getRows();
 
-const TEN_XA = process.env.TEN_XA || "Xã Xuân Lũng";
-const TEN_TINH = process.env.TEN_TINH || "Phú Thọ";
+  return rows.map(r => ({ ...r }));
+}
 
-const NO_DATA_FALLBACK =
-  "Hiện tại tôi chưa có thông tin chính xác, Ông/Bà vui lòng liên hệ bộ phận Một cửa UBND Xã Xuân Lũng hoặc hotline 0325224888 để được xác nhận.";
+// ====== XỬ LÝ TRẢ LỜI “BẠN LÀ AI?” ======
+function checkWhoAmI(question, kbRows) {
+  const keywords = ["bạn là ai", "mày là ai", "trợ lý là ai", "bạn là gì", "ai vậy"];
 
-// ===== TEMPLATE TRẢ LỜI THỦ TỤC =====
-const RESPONSE_TEMPLATE = `
+  if (keywords.some(k => question.includes(k))) {
+    const firstRow = kbRows[0];
+    return firstRow?.noi_dung_chinh?.split("\n")[0] || 
+      "Tôi là Trợ lý AI của Trung tâm Hành chính công xã Xuân Lũng.";
+  }
+  return null;
+}
+
+// ====== TÌM THỦ TỤC THEO TỪ KHÓA ======
+function findTTHC(question, rows) {
+  question = question.toLowerCase();
+
+  for (const r of rows) {
+    if (!r.tu_khoa_tim_kiem) continue;
+
+    const list = r.tu_khoa_tim_kiem.toLowerCase().split(";");
+
+    if (list.some(k => question.includes(k.trim()))) {
+      return {
+        ma: r.ma_thu_tuc,
+        ten: r.ten_thu_tuc,
+        co_quan: r.co_quan_1,
+        giay_to: [r.giay_to_1, r.giay_to_2, r.giay_to_3].filter(Boolean),
+        buoc: [r.buoc_1, r.buoc_2, r.buoc_3].filter(Boolean),
+        le_phi: r.le_phi,
+        thoi_gian: r.thoi_gian_giai_quyet,
+        link_chi_tiet: r.link_chi_tiet || "",
+        link_mau: r.link_mau_1 || "",
+      };
+    }
+  }
+  return null;
+}
+
+// ====== FORMAT TRẢ LỜI ======
+function formatTTHC(t) {
+  return `
 1️⃣ Cơ quan giải quyết:
-- ...
+- ${t.co_quan}
 
 2️⃣ Hồ sơ cần chuẩn bị:
-- ...
+${t.giay_to.map(g => `- ${g}`).join("\n")}
 
-3️⃣ Cách thực hiện:
-- B1: ...
-- B2: ...
-- B3: ...
-- Online (nếu có): ...
+3️⃣ Các bước thực hiện:
+${t.buoc.map((b, i) => `- B${i+1}: ${b}`).join("\n")}
 
 4️⃣ Lệ phí – thời gian giải quyết:
-- Lệ phí: ...
-- Thời gian: ...
+- ${t.le_phi}
+- ${t.thoi_gian}
 
 5️⃣ Link chi tiết & biểu mẫu:
-- Link chi tiết: ...
-- Mẫu/tờ khai: ...
-- Đăng ký online: ...
-`.trim();
-
-// ===== SYSTEM PROMPT CHO THỦ TỤC =====
-const SYSTEM_PROMPT_TTHC = `
-Bạn là Trợ lý AI – Hành chính công của ${TEN_XA}, ${TEN_TINH}.
-Nhiệm vụ: trả lời NGẮN – GỌN – RÕ – ĐÚNG MẪU cho THỦ TỤC HÀNH CHÍNH.
-
-🎯 QUY TẮC TRẢ LỜI
-- Không lan man, không giải thích lý thuyết dài.
-- Ưu tiên viết tắt: UBND, CCCD, HK, GPLX, TTHC, TN&MT, KH&ĐT,...
-- Tuyệt đối không nhắc "cấp huyện", "UBND huyện", "cơ quan cấp huyện", v.v.
-- Chỉ dùng: cấp xã (UBND xã), cấp tỉnh (Sở, UBND tỉnh), trung ương (Bộ, Tổng cục,...).
-- Nếu dữ liệu cho thấy cơ quan giải quyết là cấp xã → ưu tiên dùng: "UBND ${TEN_XA}".
-- Nếu là cấp tỉnh hoặc Sở → ưu tiên ghi: "Sở/UBND ... tỉnh ${TEN_TINH}".
-
-📌 FORMAT TRẢ LỜI BẮT BUỘC
-Luôn bám đúng khung sau, cả tiêu đề lẫn thứ tự:
-
-${RESPONSE_TEMPLATE}
-
-⚠️ LƯU Ý:
-- Mỗi bullet là 1 dòng.
-- Các mục 1️⃣→5️⃣ phải cách nhau rõ ràng, không gộp.
-- Không gộp tiêu đề và nội dung vào cùng dòng.
-`.trim();
-
-// ===== SYSTEM PROMPT CHO KHO TÀI LIỆU =====
-const SYSTEM_PROMPT_KB = `
-Bạn là Trợ lý AI nội bộ của ${TEN_XA}, ${TEN_TINH}.
-
-Chỉ được phép dùng thông tin trong phần "CONTEXT TÀI LIỆU" bên dưới.
-- Không được bịa, không suy diễn, không lấy dữ liệu bên ngoài.
-- Nếu câu hỏi không nằm trong nội dung context → phải trả lời đúng câu:
-"${NO_DATA_FALLBACK}"
-
-Khi trả lời:
-- Giải thích ngắn gọn, dễ hiểu, như cán bộ đang hướng dẫn trực tiếp.
-- Nếu có link_goc hoặc link_tai_lieu, hãy liệt kê rõ cho người dùng bấm vào.
-`.trim();
-
-// ====== CACHE SHEET (TTHC) ======
-let cacheTTHC = null;
-let lastFetchTTHC = 0;
-const TTL_TTHC = 5 * 60 * 1000; // 5 phút
-
-// ====== CACHE SHEET (KB TÀI LIỆU) ======
-let cacheKB = null;
-let lastFetchKB = 0;
-const TTL_KB = 5 * 60 * 1000;
-
-// ====== HÀM LOAD CSV ĐƠN GIẢN ======
-async function loadCsv(url, type) {
-  if (!url) return null;
-
-  const now = Date.now();
-  if (type === "tthc" && cacheTTHC && now - lastFetchTTHC < TTL_TTHC) return cacheTTHC;
-  if (type === "kb" && cacheKB && now - lastFetchKB < TTL_KB) return cacheKB;
-
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`Fetch CSV failed: ${res.status} ${res.statusText}`);
-  const text = await res.text();
-  if (!text.trim()) return [];
-
-  const lines = text.split("\n").filter(Boolean);
-  const header = lines[0].split(",").map((h) => h.trim());
-
-  const data = lines.slice(1).map((row) => {
-    const cols = row.split(",");
-    const item = {};
-    header.forEach((h, i) => {
-      item[h] = (cols[i] || "").trim();
-    });
-    return item;
-  });
-
-  if (type === "tthc") {
-    cacheTTHC = data;
-    lastFetchTTHC = now;
-  } else {
-    cacheKB = data;
-    lastFetchKB = now;
-  }
-
-  return data;
+- Link chi tiết: ${t.link_chi_tiet || "[Chưa có thông tin]"}
+- Mẫu/tờ khai: ${t.link_mau || "[Chưa có thông tin]"}
+`;
 }
 
-// ===== TÌM THỦ TỤC TRONG SHEET TTHC =====
-function findTT(question, data) {
-  if (!question || !data || !data.length) return null;
-  const q = question.toLowerCase();
-
-  return data.find((item) => {
-    const ten = (item.ten_thu_tuc || "").toLowerCase();
-    const ma = (item.ma_thu_tuc || "").toLowerCase();
-    const kw = (item.tu_khoa_tim_kiem || "")
-      .toLowerCase()
-      .split(";")
-      .map((x) => x.trim())
-      .filter(Boolean);
-
-    return (
-      (ten && ten.includes(q)) ||
-      (ma && ma.includes(q)) ||
-      kw.some((k) => k && q.includes(k))
-    );
-  });
-}
-
-// ===== CHUẨN HÓA CƠ QUAN GIẢI QUYẾT =====
-function normalizeAgency(raw) {
-  if (!raw) return "";
-  const txt = raw.trim();
-  const lower = txt.toLowerCase();
-
-  if (
-    lower === "xa" ||
-    lower === "xã" ||
-    /cấp\s*xã/.test(lower) ||
-    /ubnd\s*xã/.test(lower)
-  ) {
-    return `UBND ${TEN_XA}`;
-  }
-
-  if (lower === "tinh" || lower === "tỉnh" || /cấp\s*tỉnh/.test(lower)) {
-    return `UBND tỉnh ${TEN_TINH}`;
-  }
-
-  if (/^sở\s/i.test(txt) && !/tỉnh/i.test(txt)) {
-    return `${txt} ${TEN_TINH}`.trim();
-  }
-
-  if (/tỉnh/i.test(txt)) return txt;
-
-  return txt;
-}
-
-// ===== TÌM TÀI LIỆU TRONG SHEET KB =====
-function findDoc(question, data) {
-  if (!question || !data || !data.length) return null;
-  const q = question.toLowerCase();
-
-  // ưu tiên tìm theo từ khóa
-  let best = null;
-  let bestScore = 0;
-
-  for (const row of data) {
-    const title = (row.tieu_de || "").toLowerCase();
-    const kw = (row.tu_khoa || "").toLowerCase();
-    let score = 0;
-
-    if (title && q.includes(title)) score += 3;
-    if (kw) {
-      kw.split(";")
-        .map((x) => x.trim())
-        .filter(Boolean)
-        .forEach((k) => {
-          if (q.includes(k)) score += 2;
-        });
-    }
-    if (!score && title && title.includes(q)) score += 1;
-
-    if (score > bestScore) {
-      bestScore = score;
-      best = row;
-    }
-  }
-
-  return bestScore > 0 ? best : null;
-}
-
-// ===== PHÂN TÍCH CHẾ ĐỘ TỪ WIDGET =====
-function parseMode(rawMessage) {
-  const m = rawMessage.match(/^\[CHẾ ĐỘ:\s*([^\]]+)\]/i);
-  const modeLabel = m ? m[1].trim().toUpperCase() : "CHUNG";
-  const question = rawMessage.replace(/^\[CHẾ ĐỘ:[^\]]+\]\s*/i, "").trim();
-  return { modeLabel, question };
-}
-
-// ================== HANDLER ==================
+// ====== API MAIN HANDLER ======
 export default async function handler(req, res) {
-  // CORS
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-
-  if (req.method === "OPTIONS") return res.status(200).end();
-  if (req.method !== "POST") {
-    return res.status(405).json({ error: "Only POST allowed" });
-  }
-
   try {
-    const { message } = req.body || {};
-    if (!message || typeof message !== "string" || !message.trim()) {
-      return res.status(400).json({ error: "Missing 'message' field" });
+    const question = (req.query.q || "").toLowerCase().trim();
+    if (!question) return res.status(200).send("Bạn vui lòng nhập câu hỏi!");
+
+    // Load dữ liệu
+    const kbRows = await loadGoogleSheet(KB_SHEET_URL);
+    const tthcRows = await loadGoogleSheet(TTHC_SHEET_URL);
+
+    // 1️⃣ Xử lý “bạn là ai?”
+    const who = checkWhoAmI(question, kbRows);
+    if (who) return res.status(200).send(who);
+
+    // 2️⃣ Kiểm tra thủ tục hành chính
+    const foundTTHC = findTTHC(question, tthcRows);
+    if (foundTTHC) {
+      return res.status(200).send(formatTTHC(foundTTHC));
     }
 
-    const { modeLabel, question } = parseMode(message);
+    // 3️⃣ Nếu không tìm thấy – trả về câu chuẩn
+    return res.status(200).send(
+      "Hiện tại tôi chưa có thông tin chính xác, Ông/Bà vui lòng liên hệ bộ phận Một cửa UBND Xã Xuân Lũng hoặc hotline 0982250283 để được xác nhận."
+    );
 
-    // ===== TRƯỜNG HỢP HỎI THỦ TỤC / BIỂU MẪU / LIÊN HỆ CÁN BỘ =====
-    const isThuTuc =
-      modeLabel.includes("THỦ TỤC") ||
-      modeLabel.includes("BIỂU MẪU") ||
-      modeLabel.includes("LIÊN HỆ");
-
-    if (isThuTuc) {
-      const dataset = await loadCsv(TTHC_SHEET_URL, "tthc");
-      const sheetOK = Array.isArray(dataset);
-
-      if (!sheetOK) {
-        return res.status(200).json({ reply: NO_DATA_FALLBACK });
-      }
-
-      const matched = findTT(question, dataset);
-
-      if (!matched) {
-        return res.status(200).json({ reply: NO_DATA_FALLBACK });
-      }
-
-      const cq1 = normalizeAgency(matched.co_quan_1 || "");
-      const cq2 = normalizeAgency(matched.co_quan_2 || "");
-
-      const context = `
-ten_thu_tuc: ${matched.ten_thu_tuc || ""}
-
-co_quan_1: ${cq1}
-co_quan_2: ${cq2}
-
-giay_to_1: ${matched.giay_to_1 || ""}
-giay_to_2: ${matched.giay_to_2 || ""}
-giay_to_3: ${matched.giay_to_3 || ""}
-
-buoc_1: ${matched.buoc_1 || ""}
-buoc_2: ${matched.buoc_2 || ""}
-buoc_3: ${matched.buoc_3 || ""}
-
-le_phi: ${matched.le_phi || ""}
-thoi_gian_giai_quyet: ${matched.thoi_gian_giai_quyet || ""}
-
-link_chi_tiet: ${matched.link_chi_tiet || ""}
-link_mau_1: ${matched.link_mau_1 || ""}
-link_mau_2: ${matched.link_mau_2 || ""}
-link_dang_ky_online: ${matched.link_dang_ky_online || ""}
-
-ghi_chu: ${matched.ghi_chu || ""}
-      `.trim();
-
-      const messages = [
-        { role: "system", content: SYSTEM_PROMPT_TTHC },
-        {
-          role: "system",
-          content:
-            "Dưới đây là dữ liệu chính thức từ Google Sheet. Hãy tóm tắt NGẮN theo đúng format 1️⃣→5️⃣, không bịa thêm, không nhắc đến cấp huyện:\n\n" +
-            context,
-        },
-        { role: "user", content: question },
-      ];
-
-      const completion = await client.chat.completions.create({
-        model: "gpt-4o-mini",
-        temperature: 0.2,
-        messages,
-      });
-
-      const reply =
-        completion.choices?.[0]?.message?.content?.trim() || NO_DATA_FALLBACK;
-
-      return res.status(200).json({ reply });
-    }
-
-    // ===== TRƯỜNG HỢP HỎI VỀ NỘI DUNG TÀI LIỆU (FOLDER DRIVE) =====
-    const kbData = await loadCsv(KB_SHEET_URL, "kb");
-    const kbOK = Array.isArray(kbData);
-
-    if (!kbOK) {
-      return res.status(200).json({ reply: NO_DATA_FALLBACK });
-    }
-
-    const doc = findDoc(question, kbData);
-
-    if (!doc) {
-      return res.status(200).json({ reply: NO_DATA_FALLBACK });
-    }
-
-    const contextDoc = `
-[CONTEXT TÀI LIỆU]
-- Tiêu đề: ${doc.tieu_de || ""}
-- Loại: ${doc.loai || ""}
-- Từ khóa: ${doc.tu_khoa || ""}
-- Mô tả ngắn: ${doc.mo_ta_ngan || ""}
-- Nội dung chính: ${doc.noi_dung_chinh || ""}
-
-- Link gốc: ${doc.link_goc || ""}
-- Link tài liệu Drive: ${doc.link_tai_lieu || ""}
-- Ghi chú: ${doc.ghi_chu || ""}
-    `.trim();
-
-    const messages = [
-      { role: "system", content: SYSTEM_PROMPT_KB },
-      { role: "system", content: contextDoc },
-      { role: "user", content: question },
-    ];
-
-    const completion = await client.chat.completions.create({
-      model: "gpt-4o-mini",
-      temperature: 0.3,
-      messages,
-    });
-
-    let reply =
-      completion.choices?.[0]?.message?.content?.trim() || NO_DATA_FALLBACK;
-
-    // Thêm link rõ ràng cuối câu trả lời (cho chắc chắn)
-    const extraLinks = [];
-    if (doc.link_goc) extraLinks.push(`🔗 Link gốc: ${doc.link_goc}`);
-    if (doc.link_tai_lieu) extraLinks.push(`📄 Tài liệu chi tiết: ${doc.link_tai_lieu}`);
-    if (extraLinks.length) {
-      reply += `\n\n${extraLinks.join("\n")}`;
-    }
-
-    return res.status(200).json({ reply });
   } catch (err) {
-    console.error("API Error:", err);
-    return res.status(500).json({
-      reply:
-        "Bộ phận Online đang bận Ông/Bà vui lòng liên hệ hotline 0325224888 để được hỗ trợ.",
-    });
+    console.error("ERROR:", err);
+    res.status(500).send("Lỗi hệ thống API.");
   }
 }
-// ================== HẾT FILE API CHAT V2 ==================
